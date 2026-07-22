@@ -52,9 +52,19 @@ class CSVDataAdapter(BaseDataAdapter):
         # Domain column
         domain_labels = None
         if domain_column:
-            domain_labels = df[domain_column].to_numpy(dtype=np.int64)
+            col = df[domain_column]
+            if col.dtype.kind in ('i', 'u'):
+                domain_labels = col.to_numpy(dtype=np.int64)
+            elif col.dtype.kind in ('O', 'U', 'S'):
+                domain_labels = col.astype('category').cat.codes.to_numpy(dtype=np.int64)
+            else:
+                raise TypeError(f"Domain column '{domain_column}' has unsupported dtype {col.dtype}")
         elif "domain" in df.columns:
-            domain_labels = df["domain"].to_numpy(dtype=np.int64)
+            col = df["domain"]
+            if col.dtype.kind in ('i', 'u'):
+                domain_labels = col.to_numpy(dtype=np.int64)
+            elif col.dtype.kind in ('O', 'U', 'S'):
+                domain_labels = col.astype('category').cat.codes.to_numpy(dtype=np.int64)
 
         return UnifiedData(
             texts=texts,

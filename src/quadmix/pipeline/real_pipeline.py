@@ -43,6 +43,7 @@ from quadmix.data.registry import get_adapter
 from quadmix.sampling.batch_sampler import save_sampled_dataset, sample_with_optimal_params
 from quadmix.pipeline.report import generate_report, save_report
 from quadmix.data.dataset_schema import DatasetSchema
+from quadmix.utils.json_utils import sanitize_for_json
 
 
 @dataclass
@@ -88,7 +89,7 @@ class QuaDMixPipeline:
         self._quality_scorers: List = []
         self._domain_classifier = None
         self._optimizer: Optional[QuaDMixOptimizer] = None
-        self._param_sampler = ParameterSampler(config)
+        self._param_sampler = ParameterSampler(config, seed=config.seed)
 
         # Internal state
         self._precomputed_mode = False
@@ -656,7 +657,7 @@ class QuaDMixPipeline:
         params_path = os.path.join(output_dir, "optimal_parameters.json")
         serialized = self._serialize_params(optimal_params, domain_names, quality_names)
         with open(params_path, "w") as f:
-            json.dump(serialized, f, indent=2)
+            json.dump(sanitize_for_json(serialized), f, indent=2)
         print(f"\n[Stage 8] Optimal parameters saved to: {params_path}")
 
         elapsed = time.time() - t_start
@@ -708,8 +709,7 @@ class QuaDMixPipeline:
         }
         summary_path = os.path.join(output_dir, "pipeline_summary.json")
         with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2,
-                      default=lambda x: float(x) if isinstance(x, (np.floating,)) else x)
+            json.dump(sanitize_for_json(summary), f, indent=2)
 
         if text_source == "sharded":
             print(f"[Stage 8] Reading {len(selected_indices):,} sampled texts from shards...")

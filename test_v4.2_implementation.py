@@ -61,7 +61,7 @@ def test_validation_data_loading():
     val_data_path = "data/core_bmk_10tasks_v4_tokenized.pt"
     
     try:
-        val_data = torch.load(val_data_path, map_location="cpu", weights_only=False)
+        val_data = torch.load(val_data_path, map_location="cpu", weights_only=True)
         
         assert "token_ids" in val_data
         assert "loss_mask" in val_data

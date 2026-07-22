@@ -18,12 +18,12 @@ class MergedQualityConfig:
     Configuration for merging multiple quality scores (Equation 1).
 
     For each domain m, we have merging parameters α_m = (α_{1,m}, ..., α_{N,m}).
-    A global weight vector ã = (ã₁, ..., ãₙ) is shared across all domains.
+    A global weight vector ã = (ã₁, ..., ãₙ) is shared across all domains.
     The final weight for criterion n in domain m is:
-        w_{n,m} = ãₙ · b̃_{n,m}
+        w_{n,m} = ãₙ · b̃_{n,m}
     where b̃_m = (b̃_{1,m}, ..., b̃_{N,m}) are domain-specific normalized weights.
     """
-    # Global criteria weights (ã₁, ..., ãₙ) — shared across domains
+    # Global criteria weights (ã₁, ..., ãₙ) — shared across domains
     global_weights: npt.NDArray[np.float64] = field(default_factory=lambda: np.array([], dtype=np.float64))
     # Domain-specific weights (b̃_{1,m}, ..., b̃_{N,m}) — one per domain
     domain_weights: npt.NDArray[np.float64] = field(default_factory=lambda: np.array([], dtype=np.float64))
@@ -37,6 +37,15 @@ class MergedQualityConfig:
         start = domain_idx * self.num_criteria
         end = start + self.num_criteria
         return self.domain_weights[start:end]
+
+    def __eq__(self, other):
+        if not isinstance(other, MergedQualityConfig):
+            return NotImplemented
+        return np.array_equal(self.global_weights, other.global_weights) and \
+               np.array_equal(self.domain_weights, other.domain_weights)
+
+    def __hash__(self):
+        return hash((self.global_weights.tobytes(), self.domain_weights.tobytes()))
 
 
 @dataclass
@@ -74,6 +83,7 @@ class SamplingConfig:
             return self.epsilon
 
         exponent = -self.lambda_ * (self.omega - quality_rank)
+        exponent = max(-100.0, min(100.0, exponent))
         sigmoid = 2.0 / (1.0 + np.exp(exponent))
         return float(sigmoid ** self.eta + self.epsilon)
 
@@ -122,6 +132,13 @@ class ParameterSet:
         num_criteria: int,
     ) -> "ParameterSet":
         """Reconstruct ParameterSet from flattened array."""
+        expected_len = (num_criteria + 4) * num_domains
+        if len(array) != expected_len:
+            raise ValueError(
+                f"Flattened array length {len(array)} != expected "
+                f"(num_criteria+4)*num_domains = {expected_len} "
+                f"(N={num_criteria}, M={num_domains})"
+            )
         offset = 0
 
         domain_weights = array[offset:offset + num_criteria * num_domains]
@@ -160,6 +177,12 @@ class ParameterSet:
             quality_weights: {domain_name: {criterion_name: weight}}
             sampling_params: {domain_name: {"lambda": ..., "omega": ..., "eta": ..., "epsilon": ...}}
         """
+        if set(quality_weights.keys()) != set(sampling_params.keys()):
+            raise ValueError(
+                f"quality_weights and sampling_params must cover same domains: "
+                f"quality has {set(quality_weights.keys())}, "
+                f"sampling has {set(sampling_params.keys())}"
+            )
         domain_names = list(quality_weights.keys())
         quality_names = list(list(quality_weights.values())[0].keys())
         M = len(domain_names)
@@ -236,6 +259,16 @@ class QuaDMixConfig:
 
     # Target dataset size (0 = no scaling)
     target_tokens: int = 0  # Desired total tokens in sampled dataset
+
+    # Pipeline seed — controls all randomness (Alg.1 parameter sampling,
+    # Eq.1-3 document selection, budget subsampling, LightGBM search).
+    #   None  (default): each run is non-deterministic (OS entropy),
+    #          so different executions naturally produce diverse experiments.
+    #          Merging multiple runs increases LightGBM regression coverage.
+    #   int   (e.g. 42): fully reproducible — same seed always gives the
+    #          same parameter sets, sampled docs, and training subsets.
+    #          Useful for debugging or controlled A/B comparisons.
+    seed: Optional[int] = None
 
     def get_domain_param_dim(self) -> int:
         """Parameter dimension per domain: (N + 4)"""

@@ -5,7 +5,7 @@
 #
 # domain_names 顺序决定 string→int 映射: 数学=0, 化学=1, 生物学=2, 物理=3
 # quality_cols 全部 higher_better=true
-# char_count_col 直接读取预处理生成的字符数，避免首次训练扫描 text
+# char_count_col: char_count_col → 数据已预计算，无需从 text 长度推断
 # row_in_shard_col: source_record_idx → 指定行号的文本读取
 
 domain_col: category_name

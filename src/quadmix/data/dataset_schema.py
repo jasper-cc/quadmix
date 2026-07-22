@@ -119,6 +119,8 @@ class DatasetSchema:
         dtype_mismatch = []
 
         required_cols = [self.domain_col] + self.quality_cols
+        if self.text_col:
+            required_cols.append(self.text_col)
         if self.char_count_col is not None:
             required_cols.append(self.char_count_col)
 

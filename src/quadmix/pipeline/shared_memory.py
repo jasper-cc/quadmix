@@ -21,7 +21,9 @@ def ndarray_to_shared(arr: np.ndarray, prefix: str) -> SharedArrayInfo:
     shm = mp.shared_memory.SharedMemory(create=True, size=arr.nbytes, name=f"{prefix}_shm")
     shared = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
     np.copyto(shared, arr)
-    return SharedArrayInfo(name=shm.name, shape=arr.shape, dtype=str(arr.dtype), nbytes=arr.nbytes)
+    info = SharedArrayInfo(name=shm.name, shape=arr.shape, dtype=str(arr.dtype), nbytes=arr.nbytes)
+    shm.close()
+    return info
 
 
 def shared_to_ndarray(info: SharedArrayInfo) -> np.ndarray:
@@ -32,4 +34,6 @@ def shared_to_ndarray(info: SharedArrayInfo) -> np.ndarray:
     """
     shm = mp.shared_memory.SharedMemory(name=info.name)
     arr = np.ndarray(shape=info.shape, dtype=np.dtype(info.dtype), buffer=shm.buf)
-    return arr.copy()
+    result = arr.copy()
+    shm.close()
+    return result

@@ -6,6 +6,7 @@ joblib>=1.3
 pandas>=2.0
 pyarrow>=10.0
 matplotlib>=3.5
+pyyaml>=6.0
 
 # For real proxy model training (on NPU machine or GPU):
 # torch>=2.0

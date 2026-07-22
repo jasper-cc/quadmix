@@ -129,7 +129,14 @@ class ConcurrencyConfig:
         return max(1, round(self.cpu_count / max(1, n_workers)))
 
     def apply_env_vars(self):
+        import sys
         bt = self.blas_threads_for(self.max_compute_workers)
+        if "numpy" in sys.modules:
+            import logging
+            logging.getLogger(__name__).warning(
+                "numpy already imported — OPENBLAS/OMP/MKL thread settings "
+                "will have no effect. Call apply_env_vars() before importing numpy."
+            )
         os.environ.setdefault("OPENBLAS_NUM_THREADS", str(bt))
         os.environ.setdefault("OMP_NUM_THREADS", str(bt))
         os.environ.setdefault("MKL_NUM_THREADS", str(bt))

@@ -2,6 +2,7 @@
 
 import os
 import time
+import threading
 from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
@@ -9,8 +10,15 @@ from typing import Dict, List, Tuple
 class PerfTimer:
     """Lightweight performance timer with nesting support."""
     _timings: Dict[str, List[float]] = {}
-    _stack: List[Tuple[str, float]] = []
+    _timings_lock = threading.Lock()
+    _local = threading.local()
     _enabled: bool = os.environ.get("QUADMIX_PERF_TIMER", "0") == "1"
+
+    @classmethod
+    def _get_stack(cls) -> List[Tuple[str, float]]:
+        if not hasattr(cls._local, 'stack'):
+            cls._local.stack = []
+        return cls._local.stack
 
     @classmethod
     def enable(cls, enabled: bool = True):
@@ -26,26 +34,30 @@ class PerfTimer:
 
         full_name = f"{prefix}.{name}" if prefix else name
         start = time.perf_counter()
-        cls._stack.append((full_name, start))
+        stack = cls._get_stack()
+        stack.append((full_name, start))
         try:
             yield
         finally:
             elapsed = time.perf_counter() - start
-            if full_name not in cls._timings:
-                cls._timings[full_name] = []
-            cls._timings[full_name].append(elapsed)
-            cls._stack.pop()
+            with cls._timings_lock:
+                if full_name not in cls._timings:
+                    cls._timings[full_name] = []
+                cls._timings[full_name].append(elapsed)
+            stack.pop()
 
     @classmethod
     def report(cls, top_n: int = 20) -> str:
         """Generate performance report."""
-        if not cls._timings:
+        with cls._timings_lock:
+            items = list(cls._timings.items())
+        if not items:
             return "[PerfTimer] No timings recorded"
 
         lines = ["\n" + "=" * 70, "PERFORMANCE REPORT", "=" * 70]
 
         sorted_items = sorted(
-            cls._timings.items(),
+            items,
             key=lambda x: sum(x[1]),
             reverse=True
         )[:top_n]
@@ -62,5 +74,6 @@ class PerfTimer:
     @classmethod
     def reset(cls):
         """Reset all timings."""
-        cls._timings.clear()
-        cls._stack.clear()
+        with cls._timings_lock:
+            cls._timings.clear()
+        cls._local.stack = []

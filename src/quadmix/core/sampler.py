@@ -50,6 +50,17 @@ def compute_sampling_values(
 
     unique_domains = np.unique(domain_labels)
 
+    max_expected = len(params.sampling_configs) - 1
+    non_contiguous = unique_domains[(unique_domains >= 0) & (unique_domains > max_expected)]
+    if len(non_contiguous) > 0:
+        import warnings
+        warnings.warn(
+            f"Domain labels contain values beyond 0..{max_expected}: "
+            f"{non_contiguous.tolist()}. These domains will be skipped "
+            f"in sampling (sampling_value=0). Ensure domain labels are "
+            f"contiguous 0..M-1 or provide domain_names in schema."
+        )
+
     for m in unique_domains:
         mask = domain_labels == m
         indices = np.where(mask)[0]

@@ -43,7 +43,7 @@ REPO_ID = "EssentialAI/essential-web-v1.0"
 DEFAULT_CRAWL = "CC-MAIN-2024-38"
 DEFAULT_NUM_FILES = 50
 DEFAULT_WORKERS = 16
-DEFAULT_OUTPUT = "/home/ma-user/work/QuaDMix/data/essential-web"
+DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data', 'essential-web')
 
 # Support HF mirror via environment variable
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")

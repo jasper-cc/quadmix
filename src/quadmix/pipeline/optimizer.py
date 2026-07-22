@@ -814,6 +814,8 @@ class QuaDMixOptimizer:
         self._val_r2_bootstrap_mean = None
         self._bootstrap_models: List[RegressionModel] = []
 
+        regression_params_nested = {**self.regression_params, "n_jobs": self._concurrency.model_n_jobs_nested}
+
         if n_total < 10:
             print(f"[QuaDMixOptimizer] ⚠️  Too few samples ({n_total} < 10), skip bootstrap")
             return

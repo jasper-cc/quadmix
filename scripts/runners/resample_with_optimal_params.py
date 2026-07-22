@@ -108,7 +108,7 @@ def main():
     print(f"\n[Stage 0] Preprocessing raw shards...")
     preprocess_cmd = [
         sys.executable,
-        os.path.join(_SCRIPT_DIR, "preprocess_essential_web_v1_sharded.py"),
+        os.path.join(_SCRIPT_DIR, "..", "preprocess", "preprocess_essential_web_v1_sharded.py"),
         "--input-dir", args.data_dir,
         "--output-dir", preprocessed_dir,
         "--workers", str(args.workers),

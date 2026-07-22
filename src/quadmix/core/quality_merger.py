@@ -57,6 +57,25 @@ def compute_merged_quality_scores(
     # Get all unique domains
     unique_domains = np.unique(domain_labels)
 
+    neg_count = int((domain_labels < 0).sum())
+    if neg_count > 0:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Skipped {neg_count} unlabeled documents (domain_label < 0) "
+            f"during quality merging. These docs will receive merged_score=0."
+        )
+
+    max_idx = len(merge_config.domain_weights) // num_criteria - 1
+    non_contiguous = unique_domains[(unique_domains >= 0) & (unique_domains > max_idx)]
+    if len(non_contiguous) > 0:
+        import warnings
+        warnings.warn(
+            f"Domain labels contain values beyond 0..{max_idx}: "
+            f"{non_contiguous.tolist()}. These domains will get "
+            f"merged_scores=0. Ensure domain labels are contiguous "
+            f"0..M-1 or provide domain_names in schema."
+        )
+
     for m in unique_domains:
         if m < 0:  # skip unlabeled docs
             continue

@@ -32,7 +32,11 @@ def build_parser():
     parser.description = (
         "QuaDMix fixed-5000-step sequential active search on sharded data"
     )
-    parser.set_defaults(tiny_steps=FIXED_TRAIN_STEPS, checkpoint_interval=0)
+    parser.set_defaults(
+        tiny_steps=FIXED_TRAIN_STEPS,
+        checkpoint_interval=0,
+        seed=42,
+    )
     parser.add_argument(
         "--initial-experiments",
         type=int,
@@ -124,6 +128,7 @@ def main() -> int:
         top_k_average=args.top_k,
         target_tokens=int(args.target_tokens * 1e9) if args.target_tokens > 0 else 0,
         search_weight_mode=args.search_mode,
+        seed=args.seed,
     )
     active_config = ActiveSearchConfig(
         initial_experiments=args.initial_experiments,

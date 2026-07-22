@@ -9,6 +9,8 @@ import os
 import time
 from typing import List, Tuple
 
+import unicodedata
+
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -20,11 +22,21 @@ from quadmix.core.types import ParameterSet
 from quadmix.constants import DOMAIN_SHORT_NAMES
 
 
+_CJK_FONT_AVAILABLE = False
+
+
+def _str_has_cjk(s):
+    return any(unicodedata.category(c) == 'Lo' for c in str(s))
+
+
 def _get_domain_short(num_domains, domain_names=None):
     if domain_names is not None:
-        if num_domains <= len(domain_names):
-            return [str(n) for n in domain_names[:num_domains]]
-        return [str(n) for n in domain_names] + [f"D{i}" for i in range(len(domain_names), num_domains)]
+        names = [str(n) for n in domain_names[:num_domains]]
+        if not _CJK_FONT_AVAILABLE and any(_str_has_cjk(n) for n in names):
+            names = [f"D{i}" for i in range(len(names))]
+        if num_domains > len(domain_names):
+            names += [f"D{i}" for i in range(len(domain_names), num_domains)]
+        return names
     if num_domains <= len(DOMAIN_SHORT_NAMES):
         return DOMAIN_SHORT_NAMES[:num_domains]
     return DOMAIN_SHORT_NAMES + [f"D{i}" for i in range(len(DOMAIN_SHORT_NAMES), num_domains)]
@@ -38,9 +50,36 @@ QUALITY_COLORS = ["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000", "#5B9BD5",
                    "#70AD47", "#264478", "#9B59B6", "#2ECC71", "#E74C3C"]
 
 
+_CJK_TEST_CHAR = '\u6570'
+
+
+def _find_cjk_font():
+    fm = matplotlib.font_manager
+    from matplotlib.ft2font import FT2Font
+    for f in fm.fontManager.ttflist:
+        try:
+            font_file = fm.findfont(fm.FontProperties(family=f.name))
+            ft = FT2Font(font_file)
+            cmap = ft.get_charmap()
+            gid = cmap.get(ord(_CJK_TEST_CHAR))
+            if gid is not None and gid != 0:
+                return f.name
+        except Exception:
+            continue
+    return None
+
+
 def _setup_style():
+    global _CJK_FONT_AVAILABLE
+    cjk_font = _find_cjk_font()
+    if cjk_font is not None:
+        chosen = cjk_font
+        _CJK_FONT_AVAILABLE = True
+    else:
+        chosen = "DejaVu Sans"
+        _CJK_FONT_AVAILABLE = False
     plt.rcParams.update({
-        "font.family": "DejaVu Sans",
+        "font.family": chosen,
         "font.size": 10,
         "axes.titlesize": 12,
         "axes.labelsize": 11,
@@ -48,6 +87,7 @@ def _setup_style():
         "savefig.dpi": 150,
         "savefig.bbox": "tight",
         "savefig.pad_inches": 0.1,
+        "axes.unicode_minus": False,
     })
 
 
@@ -126,7 +166,7 @@ def _make_fig2(domain_weights, num_domains, num_criteria, output_dir,
         max_val = row[max_idx]
         if max_val > 0.20:
             prefix = sum(row[:max_idx])
-            ax.text(i, prefix + max_val / 2, QUALITY_SHORT[max_idx],
+            ax.text(i, prefix + max_val / 2, _DEFAULT_QUALITY_SHORT[max_idx % len(_DEFAULT_QUALITY_SHORT)],
                     ha="center", va="center", fontsize=7,
                     fontweight="bold", color="white")
     plt.tight_layout()

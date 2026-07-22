@@ -135,5 +135,5 @@ DEFAULT_VAL_DIR = os.path.join(PROJECT_DIR, "data")
 
 DEFAULT_EVAL_BUNDLE = os.environ.get(
     "EVAL_BUNDLE_DIR",
-    "/home/ma-user/work/nanochat-master-multi/eval_bundle",
+    os.path.join(PROJECT_DIR, "eval_bundle"),
 )

@@ -55,14 +55,15 @@ class JSONLDataAdapter(BaseDataAdapter):
                 if text_key:
                     text = record.get(text_key, "")
                 else:
-                    text = self._detect_text_key(record)
+                    detected_key = self._detect_text_key_name(record)
+                    text = str(record.get(detected_key, "")) if detected_key else self._extract_text_fallback(record)
                 texts.append(text)
 
                 if domain_key:
                     domain_labels_list.append(record.get(domain_key, -1))
 
         if not text_key:
-            text_key = self._detect_text_key({k: "" for k in all_keys})
+            text_key = self._detect_text_key_name({k: "" for k in all_keys})
 
         doc_ids = self._generate_doc_ids(texts)
         token_counts = np.array(
@@ -111,12 +112,22 @@ class JSONLDataAdapter(BaseDataAdapter):
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     @staticmethod
-    def _detect_text_key(record: dict) -> str:
-        """Auto-detect the text key from common conventions."""
+    def _detect_text_key_name(record: dict) -> str:
+        """Auto-detect the text KEY NAME from common conventions."""
+        for key in ["text", "content", "document", "doc", "body", "sentence", "input"]:
+            if key in record:
+                return key
+        for k, v in record.items():
+            if isinstance(v, str) and len(v) > 20:
+                return k
+        return ""
+
+    @staticmethod
+    def _extract_text_fallback(record: dict) -> str:
+        """Extract text value when no standard key is found."""
         for key in ["text", "content", "document", "doc", "body", "sentence", "input"]:
             if key in record:
                 return str(record[key])
-        # First string value
         for v in record.values():
             if isinstance(v, str) and len(v) > 20:
                 return v

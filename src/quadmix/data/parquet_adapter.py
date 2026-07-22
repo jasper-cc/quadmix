@@ -70,12 +70,23 @@ class ParquetDataAdapter(BaseDataAdapter):
         # Auto-detect domain column
         domain_labels = None
         if domain_column:
-            domain_labels = df[domain_column].to_numpy(dtype=np.int64)
+            col = df[domain_column]
+            if col.dtype.kind in ('i', 'u'):
+                domain_labels = col.to_numpy(dtype=np.int64)
+            elif col.dtype.kind in ('O', 'U', 'S'):
+                domain_labels = col.astype('category').cat.codes.to_numpy(dtype=np.int64)
+            else:
+                raise TypeError(f"Domain column '{domain_column}' has unsupported dtype {col.dtype}")
         else:
             for candidate in ["domain", "label", "category", "domain_id"]:
                 if candidate in df.columns:
-                    domain_labels = df[candidate].to_numpy(dtype=np.int64)
-                    break
+                    col = df[candidate]
+                    if col.dtype.kind in ('i', 'u'):
+                        domain_labels = col.to_numpy(dtype=np.int64)
+                    elif col.dtype.kind in ('O', 'U', 'S'):
+                        domain_labels = col.astype('category').cat.codes.to_numpy(dtype=np.int64)
+                    if domain_labels is not None:
+                        break
 
         # Token counts
         token_counts = None

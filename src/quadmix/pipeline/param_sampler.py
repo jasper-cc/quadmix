@@ -49,7 +49,7 @@ class ParameterSampler:
         # Sample (a₁, ..., aₙ) ~ U(0, 1)
         a = self._rng.uniform(0, 1, size=N)
         # Normalize: ãₙ = aₙ / Σ aᵢ
-        a_norm = a / a.sum()
+        a_norm = a / max(a.sum(), 1e-10)
 
         # === Step 2: For each domain m ===
         domain_weights_list = []
@@ -61,7 +61,7 @@ class ParameterSampler:
 
             # Compute final weight: b̃ₙ = ãₙ · bₙ / Σ ãᵢ · bᵢ
             b_raw = a_norm * b
-            b_norm = b_raw / b_raw.sum()
+            b_norm = b_raw / max(b_raw.sum(), 1e-10)
 
             # α_m = (b̃₁, ..., b̃ₙ)
             domain_weights_list.extend(b_norm)
@@ -116,11 +116,11 @@ class ParameterSampler:
         M = self.config.num_domains
 
         a_all = self._rng.uniform(0, 1, size=(n, N))
-        a_norm_all = a_all / a_all.sum(axis=1, keepdims=True)
+        a_norm_all = a_all / np.clip(a_all.sum(axis=1, keepdims=True), 1e-10, None)
 
         b_all = self._rng.uniform(0, 1, size=(n, M, N))
         b_raw_all = a_norm_all[:, np.newaxis, :] * b_all
-        b_norm_all = b_raw_all / b_raw_all.sum(axis=2, keepdims=True)
+        b_norm_all = b_raw_all / np.clip(b_raw_all.sum(axis=2, keepdims=True), 1e-10, None)
 
         lambda_all = self._rng.uniform(self.config.lambda_min, self.config.lambda_max, size=(n, M)) * self.config.lambda_scale
         omega_all = self._rng.uniform(self.config.omega_min, self.config.omega_max, size=(n, M)) * self.config.omega_scale

@@ -10,6 +10,7 @@ Aligned with RegMix (Liu et al., 2024, ICLR 2025, arXiv:2407.01492)
     Tied embedding + LM head
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -80,6 +81,11 @@ class CausalSelfAttention(nn.Module):
             dim=self.head_dim, max_seq_len=config.block_size, base=config.rope_base,
         )
 
+        causal_mask = torch.triu(
+            torch.ones(config.block_size, config.block_size), diagonal=1
+        ).bool()
+        self.register_buffer("causal_mask", causal_mask)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -89,7 +95,13 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(x, T)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * math.sqrt(self.head_dim) ** -1
+        attn = attn.masked_fill(
+            self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(0), float("-inf")
+        )
+        attn = F.softmax(attn, dim=-1)
+        y = torch.matmul(attn, v)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
@@ -205,8 +217,10 @@ class ProxyModel(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, return_hidden: bool = False):
         B, T = input_ids.shape
-        assert T <= self.config.block_size, \
-            f"Sequence length {T} exceeds block_size {self.config.block_size}"
+        if T > self.config.block_size:
+            raise ValueError(
+                f"Sequence length {T} exceeds block_size {self.config.block_size}"
+            )
 
         x = self.embed(input_ids)  # (B, T, C)
 

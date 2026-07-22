@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import shutil
+import ssl
 import sys
 import time
 import urllib.request
@@ -31,6 +32,8 @@ try:
     import quadmix
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'src'))
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import numpy as np
 
@@ -44,6 +47,7 @@ from quadmix.constants import (
     DEFAULT_VAL_DIR, HF_ENDPOINT, HF_RESOLVE,
     HF_OPENHERMES_DATASET, HF_OPENHERMES_FILENAME,
     HF_CORE_DATASET, HF_CORE_FILENAME,
+    HF_CORE_BMK_V2_DATASET, HF_CORE_BMK_V2_FILENAME,
     HF_CORE_BMK_V3_DATASET, HF_CORE_BMK_V3_FILENAME,
     HF_CORE_BMK_V4_DATASET, HF_CORE_BMK_V4_FILENAME,
     HF_CORE_BMK_V42_DATASET, HF_CORE_BMK_V42_FILENAME,
@@ -62,8 +66,9 @@ QUADMIX_TEMP_DIR = DEFAULT_TEMP_DIR
 def _hf_remote_size(repo_id: str, filename: str) -> int:
     url = f"{HF_ENDPOINT}/datasets/{repo_id}/resolve/main/{filename}"
     try:
+        ctx = ssl._create_unverified_context()
         req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
             return int(resp.headers.get("Content-Length", 0))
     except Exception:
         pass
@@ -107,6 +112,9 @@ def resolve_val_path(val_set: str, val_path: str) -> str:
     if val_set == "core":
         local = os.path.join(DEFAULT_VAL_DIR, HF_CORE_FILENAME)
         return _check_and_download(local, HF_CORE_DATASET, HF_CORE_FILENAME)
+    if val_set == "core_bmk_v2":
+        local = os.path.join(DEFAULT_VAL_DIR, HF_CORE_BMK_V2_FILENAME)
+        return _check_and_download(local, HF_CORE_BMK_V2_DATASET, HF_CORE_BMK_V2_FILENAME)
     if val_set == "core_bmk_v3":
         local = os.path.join(DEFAULT_VAL_DIR, HF_CORE_BMK_V3_FILENAME)
         return _check_and_download(local, HF_CORE_BMK_V3_DATASET, HF_CORE_BMK_V3_FILENAME)
@@ -149,7 +157,7 @@ def build_parser():
     p.add_argument("--preprocessed-dir", required=True,
                    help="Path to preprocessed shards directory")
     p.add_argument("--val-set", type=str, default="core",
-                   choices=["openhermes", "core", "core_bmk_v3", "core_bmk_v4", "core_bmk_v4.2", "core_bmk_v4.3", "core_bmk_v5", "core_bmk_v6", "cap_v1", "stem_v1"],
+                   choices=["openhermes", "core", "core_bmk_v2", "core_bmk_v3", "core_bmk_v4", "core_bmk_v4.2", "core_bmk_v4.3", "core_bmk_v5", "core_bmk_v6", "cap_v1", "stem_v1"],
                    help="New validation set to evaluate on (default: core)")
     p.add_argument("--val-path", type=str, default=None,
                    help="Path to custom validation .pt file (overrides --val-set)")
@@ -499,7 +507,7 @@ def main():
             "num_selected_docs": len(selected_indices),
             "sampling_ratio": len(selected_indices) / n_docs,
             "domain_distribution_change": _build_domain_dist_change(
-                orig_dist, sel_dist, config.num_domains),
+                orig_dist, sel_dist, config.num_domains, domain_names=domain_names),
         },
         "per_task_loss_stats": per_task_loss_stats,
         "per_task_analysis": pipeline._optimizer.per_task_analysis,
@@ -629,11 +637,11 @@ def main():
     return 0
 
 
-def _build_domain_dist_change(orig_dist, sel_dist, num_domains):
+def _build_domain_dist_change(orig_dist, sel_dist, num_domains, domain_names=None):
     change = {}
     for m in range(num_domains):
         if orig_dist[m] > 0:
-            name = domain_names[m] if m < len(domain_names) else f"D{m}"
+            name = domain_names[m] if domain_names and m < len(domain_names) else f"D{m}"
             change[name] = {
                 "original": int(orig_dist[m]),
                 "selected": int(sel_dist[m]),

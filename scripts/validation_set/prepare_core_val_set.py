@@ -34,7 +34,10 @@ import torch
 from transformers import AutoTokenizer
 
 
-EVAL_BUNDLE_DIR = "/home/ma-user/work/nanochat-master-multi/eval_bundle"
+EVAL_BUNDLE_DIR = os.environ.get(
+    "EVAL_BUNDLE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'eval_bundle'),
+)
 OUTPUT_DIR = "data"
 SEED = 42
 BLOCK_SIZE = 2048

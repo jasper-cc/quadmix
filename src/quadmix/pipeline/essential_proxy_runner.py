@@ -29,7 +29,6 @@ from functools import partial
 from typing import List, Optional, Dict, Tuple, Callable
 from joblib import Parallel, delayed
 from contextlib import contextmanager
-import pandas as pd
 
 import warnings
 warnings.filterwarnings("ignore", message=".*owner does not match.*")
@@ -37,6 +36,12 @@ warnings.filterwarnings("ignore", message=".*owner does not match.*")
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+def _safe_npu_empty_cache():
+    try:
+        torch.npu.empty_cache()
+    except Exception:
+        pass
 
 from quadmix.core.types import ParameterSet, ProxyResult, QuaDMixConfig
 from quadmix.core.quality_merger import compute_merged_quality_scores
@@ -50,6 +55,7 @@ from quadmix.utils.concurrency import (
     get_blas_threads,
     set_blas_threads,
 )
+from quadmix.utils.json_utils import sanitize_for_json
 from quadmix.pipeline.loss_utils import (
     chunked_loss_from_hidden, chunked_loss_per_token_from_hidden, compute_val_batch_size,
 )
@@ -63,36 +69,53 @@ from quadmix.pipeline.parallel_dispatch import (
 from collections import namedtuple
 
 _PreSampleData = namedtuple("_PreSampleData", [
-    "normalized_quality_info", "domain_indices_infos",
-    "token_counts_info", "has_token_counts",
+    "sub_quality_infos", "domain_indices_infos",
+    "sub_token_counts_infos", "has_token_counts",
     "num_domains", "rank_ref_size", "num_docs",
+    "seed_offset",
 ])
+
+
+class GraphedTrainStep(torch.nn.Module):
+    def __init__(self, model, chunk_size):
+        super().__init__()
+        self.model = model
+        self.chunk_size = chunk_size
+
+    def forward(self, inp, tgt):
+        hidden = self.model(inp, return_hidden=True)
+        loss = chunked_loss_from_hidden(self.model, hidden, tgt, chunk_size=self.chunk_size)
+        return loss
 
 
 def _presample_one(args):
     i, params, data = args
     from quadmix.pipeline.shared_memory import shared_to_ndarray
-    normalized_quality = shared_to_ndarray(data.normalized_quality_info)
+    sub_qualities = {m: shared_to_ndarray(info) for m, info in data.sub_quality_infos.items()}
     domain_indices = {m: shared_to_ndarray(info) for m, info in data.domain_indices_infos.items()}
-    token_counts = shared_to_ndarray(data.token_counts_info) if data.has_token_counts else None
+    sub_tc = {}
+    if data.has_token_counts:
+        sub_tc = {m: shared_to_ndarray(info) for m, info in data.sub_token_counts_infos.items()}
 
+    seed_offset = data.seed_offset
     M = data.num_domains
-    rng_eq2 = np.random.default_rng(i + 1729)
-    rng_sample = np.random.default_rng(i + 42)
-    has_tokens = token_counts is not None
+    rng_eq2 = np.random.default_rng(i + seed_offset + 1729)
+    rng_sample = np.random.default_rng(i + seed_offset + 42)
+    has_tokens = data.has_token_counts
 
     domain_selected = []
 
     for m in range(M):
-        indices = domain_indices.get(m)
-        if indices is None or len(indices) == 0:
+        if m not in sub_qualities or len(sub_qualities[m]) == 0:
             continue
         if m >= len(params.sampling_configs):
             continue
 
-        n_m = len(indices)
+        sub_q = sub_qualities[m]
+        indices = domain_indices.get(m)
+        n_m = len(sub_q)
         alpha_m = params.merge_config.get_final_weights(m)
-        domain_scores = normalized_quality[indices] @ alpha_m
+        domain_scores = sub_q @ alpha_m
 
         k = min(data.rank_ref_size, n_m)
         ref_idx = rng_eq2.choice(n_m, k, replace=False)
@@ -101,8 +124,8 @@ def _presample_one(args):
         ref_scores = ref_scores_unsorted[sort_order]
         positions = np.searchsorted(-ref_scores, -domain_scores, side='right')
 
-        if has_tokens:
-            ref_tokens = token_counts[indices[ref_idx]][sort_order].astype(np.float64)
+        if has_tokens and m in sub_tc:
+            ref_tokens = sub_tc[m][ref_idx][sort_order].astype(np.float64)
             cum_tokens = np.concatenate(([0.0], np.cumsum(ref_tokens)))
             total_ref_tokens = cum_tokens[-1]
             if total_ref_tokens > 0:
@@ -131,7 +154,7 @@ def _presample_one(args):
     if domain_selected:
         return i, np.concatenate(domain_selected)
     else:
-        rng2 = np.random.default_rng(i + 42)
+        rng2 = np.random.default_rng(i + seed_offset + 42)
         return i, rng2.choice(np.arange(data.num_docs), 100, replace=False)
 
 
@@ -172,12 +195,14 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             domain_names: Optional[List[str]] = None,
             quality_names: Optional[List[str]] = None,
             quality_directions: Optional[List[bool]] = None,
+            worker_mode: bool = False,
     ):
         from quadmix.constants import DEFAULT_TOKEN_CACHE_DIR
         if token_cache_dir is None:
             token_cache_dir = DEFAULT_TOKEN_CACHE_DIR
 
         self.config = config
+        self._seed_offset = config.seed if config.seed is not None else np.random.default_rng().integers(0, 2**31)
         self._concurrency = ConcurrencyConfig()
         self.metadata_manager = metadata_manager
         self.legacy_data_path = data_path
@@ -196,6 +221,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         self._domain_names = domain_names
         self._quality_names = quality_names
         self._quality_directions = quality_directions
+        self._worker_mode = worker_mode
 
         self.global_batch_size = global_batch_size
         self.micro_batch_size = micro_batch_size
@@ -245,7 +271,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             raise ValueError("Either metadata_manager or data_path must be provided")
 
         print(f"[ProxyRunner] Loading validation set: {self.val_data_path}")
-        val_data = torch.load(self.val_data_path, map_location="cpu", weights_only=False)
+        val_data = torch.load(self.val_data_path, map_location="cpu", weights_only=True)
         self._val_token_ids = val_data["token_ids"]
         self._val_loss_mask = val_data["loss_mask"]
         self._val_task_labels = val_data.get("task_labels", None)
@@ -277,30 +303,36 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         print(f"[ProxyRunner] Sharded mode: {self._num_docs:,} docs "
               f"(metadata only, {mgr.num_shards} shards) ({time.time() - t0:.0f}s)")
 
-        from quadmix.utils.normalization import get_normalizer
-        self._normalizer_name = "rank"
-        normalize_fn = get_normalizer(self._normalizer_name)
+        if self._worker_mode:
+            self._normalized_quality = None
+            self._domain_indices: Dict[int, np.ndarray] = {}
+            print(f"[ProxyRunner] Worker mode: skipped normalization + domain indices "
+                  f"(selected_idx pre-computed by main process)")
+        else:
+            from quadmix.utils.normalization import get_normalizer
+            self._normalizer_name = "rank"
+            normalize_fn = get_normalizer(self._normalizer_name)
 
-        t1 = time.time()
-        num_criteria = self._quality_scores.shape[1]
-        n_jobs = min(num_criteria, os.cpu_count()) if self._num_docs > 50000 else 1
-        normalized_cols = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(normalize_fn)(self._quality_scores[:, n]) for n in range(num_criteria)
-        )
-        self._normalized_quality = np.column_stack(normalized_cols).astype(self._quality_scores.dtype)
-        print(f"[ProxyRunner] Pre-normalized {num_criteria} quality criteria "
-              f"({time.time() - t1:.1f}s) — Eq.1 now ~5x faster per experiment")
+            t1 = time.time()
+            num_criteria = self._quality_scores.shape[1]
+            n_jobs = min(num_criteria, os.cpu_count()) if self._num_docs > 50000 else 1
+            normalized_cols = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(normalize_fn)(self._quality_scores[:, n]) for n in range(num_criteria)
+            )
+            self._normalized_quality = np.column_stack(normalized_cols).astype(self._quality_scores.dtype)
+            print(f"[ProxyRunner] Pre-normalized {num_criteria} quality criteria "
+                  f"({time.time() - t1:.1f}s) — Eq.1 now ~5x faster per experiment")
 
-        t2 = time.time()
-        sort_idx = np.argsort(self._domain_labels)
-        sorted_labels = self._domain_labels[sort_idx]
-        boundaries = np.concatenate([[0], np.where(sorted_labels[:-1] != sorted_labels[1:])[0] + 1, [self._num_docs]])
-        self._domain_indices: Dict[int, np.ndarray] = {}
-        for i in range(len(boundaries) - 1):
-            domain_id = int(sorted_labels[boundaries[i]])
-            self._domain_indices[domain_id] = sort_idx[boundaries[i]:boundaries[i + 1]]
-        print(f"[ProxyRunner] Pre-computed domain indices for {len(self._domain_indices)} domains "
-              f"({time.time() - t2:.1f}s) — Eq.1 mask elimination")
+            t2 = time.time()
+            sort_idx = np.argsort(self._domain_labels)
+            sorted_labels = self._domain_labels[sort_idx]
+            boundaries = np.concatenate([[0], np.where(sorted_labels[:-1] != sorted_labels[1:])[0] + 1, [self._num_docs]])
+            self._domain_indices: Dict[int, np.ndarray] = {}
+            for i in range(len(boundaries) - 1):
+                domain_id = int(sorted_labels[boundaries[i]])
+                self._domain_indices[domain_id] = sort_idx[boundaries[i]:boundaries[i + 1]]
+            print(f"[ProxyRunner] Pre-computed domain indices for {len(self._domain_indices)} domains "
+                  f"({time.time() - t2:.1f}s) — Eq.1 mask elimination")
 
         os.makedirs(self.token_cache_dir, exist_ok=True)
         self._cache_hits = 0
@@ -309,6 +341,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         self._memory_cache: Dict[int, dict] = {}
         self._memory_cache_bytes: int = 0
         self._memory_cache_lru: List[int] = []
+        self._memory_cache_lock = threading.Lock()
 
     def _tokenize_texts(self, texts: List[str]) -> torch.Tensor:
         """Tokenize a list of texts into [M, block_size] int64 tensor."""
@@ -326,80 +359,85 @@ class EssentialWebProxyRunner(BaseProxyRunner):
 
     def _memory_cache_get_rows(self, sid: int) -> set:
         """Return set of row_in_shard already in memory cache for this shard."""
-        if sid not in self._memory_cache:
-            return set()
-        if sid in self._memory_cache_lru:
-            self._memory_cache_lru.remove(sid)
-            self._memory_cache_lru.append(sid)
-        return set(int(r) for r in self._memory_cache[sid]["rows"])
+        with self._memory_cache_lock:
+            if sid not in self._memory_cache:
+                return set()
+            if sid in self._memory_cache_lru:
+                self._memory_cache_lru.remove(sid)
+                self._memory_cache_lru.append(sid)
+            return set(int(r) for r in self._memory_cache[sid]["rows"])
 
     def _memory_cache_add_rows(self, sid: int, new_rows: np.ndarray, new_tokens: np.ndarray,
                                 skip_eviction: bool = False):
         """Add new rows to memory cache. LRU eviction when over limit."""
-        old_bytes = 0
-        if sid in self._memory_cache:
-            old_data = self._memory_cache[sid]
-            old_bytes = old_data["rows"].nbytes + old_data["tokens"].nbytes
+        with self._memory_cache_lock:
+            old_bytes = 0
+            if sid in self._memory_cache:
+                old_data = self._memory_cache[sid]
+                old_bytes = old_data["rows"].nbytes + old_data["tokens"].nbytes
 
-        if sid not in self._memory_cache:
-            self._memory_cache[sid] = {
-                "rows": np.array([], dtype=np.int64),
-                "tokens": np.zeros((0, new_tokens.shape[1]), dtype=np.int32),
-            }
+            if sid not in self._memory_cache:
+                self._memory_cache[sid] = {
+                    "rows": np.array([], dtype=np.int64),
+                    "tokens": np.zeros((0, new_tokens.shape[1]), dtype=np.int32),
+                }
 
-        old = self._memory_cache[sid]
-        old_rows = old["rows"]
-        old_tokens = old["tokens"]
+            old = self._memory_cache[sid]
+            old_rows = old["rows"]
+            old_tokens = old["tokens"]
 
-        combined_rows = np.concatenate([old_rows, new_rows])
-        combined_tokens = np.concatenate([old_tokens, new_tokens])
+            combined_rows = np.concatenate([old_rows, new_rows])
+            combined_tokens = np.concatenate([old_tokens, new_tokens])
 
-        row_to_idx = {}
-        for i, r in enumerate(combined_rows):
-            row_to_idx[int(r)] = i
+            row_to_idx = {}
+            for i, r in enumerate(combined_rows):
+                row_to_idx[int(r)] = i
 
-        unique_rows = np.array(sorted(row_to_idx.keys()), dtype=np.int64)
-        final_tokens = combined_tokens[[row_to_idx[int(r)] for r in unique_rows]]
+            unique_rows = np.array(sorted(row_to_idx.keys()), dtype=np.int64)
+            final_tokens = combined_tokens[[row_to_idx[int(r)] for r in unique_rows]]
 
-        new_bytes = unique_rows.nbytes + final_tokens.nbytes
-        self._memory_cache[sid] = {"rows": unique_rows, "tokens": final_tokens}
+            new_bytes = unique_rows.nbytes + final_tokens.nbytes
+            self._memory_cache[sid] = {"rows": unique_rows, "tokens": final_tokens}
 
-        self._memory_cache_bytes += new_bytes - old_bytes
-        if sid in self._memory_cache_lru:
-            self._memory_cache_lru.remove(sid)
-        self._memory_cache_lru.append(sid)
+            self._memory_cache_bytes += new_bytes - old_bytes
+            if sid in self._memory_cache_lru:
+                self._memory_cache_lru.remove(sid)
+            self._memory_cache_lru.append(sid)
 
-        if skip_eviction:
-            return
+            if skip_eviction:
+                return
 
-        max_bytes = int(self.memory_cache_max_gb * 1024 ** 3)
-        while self._memory_cache_bytes > max_bytes and self._memory_cache_lru:
-            victim_sid = self._memory_cache_lru.pop(0)
-            if victim_sid in self._memory_cache:
-                victim = self._memory_cache.pop(victim_sid)
-                self._memory_cache_bytes -= (victim["rows"].nbytes + victim["tokens"].nbytes)
+            max_bytes = int(self.memory_cache_max_gb * 1024 ** 3)
+            while self._memory_cache_bytes > max_bytes and self._memory_cache_lru:
+                victim_sid = self._memory_cache_lru.pop(0)
+                if victim_sid in self._memory_cache:
+                    victim = self._memory_cache.pop(victim_sid)
+                    self._memory_cache_bytes -= (victim["rows"].nbytes + victim["tokens"].nbytes)
 
     def _memory_cache_query(self, sid: int, requested_rows: List[int]) -> Tuple[np.ndarray, List[int], List[int]]:
         """Query memory cache for requested rows."""
-        cached_rows = self._memory_cache_get_rows(sid)
-        hit_rows_set = [r for r in requested_rows if int(r) in cached_rows]
-        miss_rows = [r for r in requested_rows if int(r) not in cached_rows]
+        with self._memory_cache_lock:
+            if sid not in self._memory_cache:
+                return np.zeros((0, self.block_size), dtype=np.int32), [], requested_rows
+            cache_data = self._memory_cache[sid]
+            cache_rows_set = set(int(r) for r in cache_data["rows"])
+            hit_rows_set = [r for r in requested_rows if int(r) in cache_rows_set]
+            miss_rows = [r for r in requested_rows if int(r) not in cache_rows_set]
 
-        if not hit_rows_set:
-            return np.zeros((0, self.block_size), dtype=np.int32), [], miss_rows
+            if not hit_rows_set:
+                return np.zeros((0, self.block_size), dtype=np.int32), [], miss_rows
 
-        cache_data = self._memory_cache[sid]
-        cache_rows = cache_data["rows"]
-        cache_tokens = cache_data["tokens"]
+            cache_rows_arr = cache_data["rows"]
+            cache_tokens = cache_data["tokens"]
 
-        sorted_hit_rows = sorted(hit_rows_set)
-        positions = np.searchsorted(cache_rows, sorted_hit_rows)
+            sorted_hit_rows = sorted(hit_rows_set)
+            positions = np.searchsorted(cache_rows_arr, sorted_hit_rows)
 
-        valid_mask = positions < len(cache_rows)
-        assert valid_mask.all(), f"Some hit rows not in cache: {sorted_hit_rows}"
+            valid_mask = positions < len(cache_rows_arr)
+            assert valid_mask.all(), f"Some hit rows not in cache: {sorted_hit_rows}"
 
-        tokens = cache_tokens[positions]
-        return tokens, sorted_hit_rows, miss_rows
+            tokens = cache_tokens[positions].copy()
+            return tokens, sorted_hit_rows, miss_rows
 
     def _get_shard_token_path(self, shard_idx: int) -> str:
         """Path to disk cache for a shard's selected tokens (npz, mmap-compatible)."""
@@ -413,8 +451,8 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         cache_path = self._get_shard_token_path(sid)
         if not os.path.exists(cache_path):
             return set()
-        data = np.load(cache_path)
-        rows = set(data['rows'].tolist())
+        with np.load(cache_path) as data:
+            rows = set(data['rows'].tolist())
         return rows
 
     def _cache_add_rows(self, sid: int, new_rows: np.ndarray, new_tokens: torch.Tensor):
@@ -438,10 +476,9 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 if os.path.exists(cache_path):
-                    old = np.load(cache_path)
-                    old_rows = old['rows']
-                    old_tokens = old['tokens']
-                    del old
+                    with np.load(cache_path) as old:
+                        old_rows = old['rows'].copy()
+                        old_tokens = old['tokens'].copy()
                 else:
                     old_rows = np.array([], dtype=np.int64)
                     old_tokens = np.zeros((0, new_np.shape[1]), dtype=np.int32)
@@ -476,6 +513,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             batch_exp_ids: List[int],
             async_write_queue: Optional["Queue"] = None,
             shm_store: Optional[Dict[int, tuple]] = None,
+            shm_lock: Optional[threading.Lock] = None,
     ) -> Dict[int, str]:
         """NPU Parallel Mode: Batch tokenize union miss rows across all experiments."""
         t0 = time.time()
@@ -509,9 +547,13 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                     shm = SharedMemory(create=True, size=result.nbytes)
                     shm_array = np.ndarray(result.shape, dtype=result.dtype, buffer=shm.buf)
                     shm_array[:] = result[:]
-                    shm_store[exp_id] = (shm.name, result.shape, result.dtype.str)
+                    if shm_lock:
+                        with shm_lock:
+                            shm_store[exp_id] = (shm.name, result.shape, result.dtype.str)
+                    else:
+                        shm_store[exp_id] = (shm.name, result.shape, result.dtype.str)
                     shm.close()
-                    exp_token_paths[exp_id] = f"shm://{shm_store[exp_id][0]}"
+                    exp_token_paths[exp_id] = f"shm://{shm.name}"
                 else:
                     exp_token_path = self._get_exp_token_path(exp_id)
                     np.save(exp_token_path, result)
@@ -569,18 +611,19 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             if miss_row_col:
                 shard_path = mgr._per_shard_info[sid]["path"]
                 miss_arr = np.array(sorted(miss_row_col), dtype=np.int64)
-                shard_miss_info[sid] = (shard_path, miss_arr)
+                shard_total_rows = mgr._per_shard_info[sid]["num_docs"]
+                shard_miss_info[sid] = (shard_path, miss_arr, mgr._is_row_col_sequential, shard_total_rows)
                 total_miss_rows += len(miss_row_col)
 
             if hit_in_disk:
                 cache_path = self._get_shard_token_path(sid)
-                data = np.load(cache_path)
-                disk_rows = data['rows']
-                disk_tokens = data['tokens']
+                with np.load(cache_path) as data:
+                    disk_rows = data['rows']
+                    disk_tokens = data['tokens']
 
-                row_to_pos = {int(r): i for i, r in enumerate(disk_rows)}
-                positions = np.array([row_to_pos[int(r)] for r in hit_in_disk], dtype=np.int64)
-                hit_tokens = disk_tokens[positions]
+                    row_to_pos = {int(r): i for i, r in enumerate(disk_rows)}
+                    positions = np.array([row_to_pos[int(r)] for r in hit_in_disk], dtype=np.int64)
+                    hit_tokens = disk_tokens[positions]
 
                 self._memory_cache_add_rows(sid, np.array(hit_in_disk, dtype=np.int64), hit_tokens)
 
@@ -590,15 +633,20 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             print(f"[BatchTokenize] {total_miss_rows:,} miss rows across {len(shard_miss_info)} shards")
 
         if shard_miss_info:
+            schema = self.metadata_manager.schema
             read_t0 = time.time()
 
             shard_tasks = [
-                (sid, shard_path, miss_rows_arr.tolist())
-                for sid, (shard_path, miss_rows_arr) in shard_miss_info.items()
+                (sid, shard_path, miss_rows_arr.tolist(), is_seq, total_rows)
+                for sid, (shard_path, miss_rows_arr, is_seq, total_rows) in shard_miss_info.items()
             ]
 
             parallel_results = _tokenize_shard_parallel(
-                shard_tasks, self.tokenizer.name_or_path, self.block_size
+                shard_tasks, self.tokenizer.name_or_path, self.block_size,
+                text_col=schema.text_col,
+                row_in_shard_col=schema.row_in_shard_col,
+                has_row_in_shard=self.metadata_manager._has_row_in_shard,
+                is_row_col_sequential=self.metadata_manager._is_row_col_sequential,
             )
 
             for sid, parsed_rows, miss_tokens, io_time, tokenize_time, total_time in parallel_results:
@@ -625,7 +673,9 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             shard_starts = mgr._shard_starts
             global_ids_list = []
             tokens_list = []
-            for sid, cache_data in self._memory_cache.items():
+            with self._memory_cache_lock:
+                cache_snapshot = list(self._memory_cache.items())
+            for sid, cache_data in cache_snapshot:
                 rows = cache_data["rows"]
                 tokens = cache_data["tokens"]
                 seq_positions = mgr.row_col_to_local(sid, rows)
@@ -659,9 +709,13 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 shm = SharedMemory(create=True, size=result.nbytes)
                 shm_array = np.ndarray(result.shape, dtype=result.dtype, buffer=shm.buf)
                 shm_array[:] = result[:]
-                shm_store[exp_id] = (shm.name, result.shape, result.dtype.str)
+                if shm_lock:
+                    with shm_lock:
+                        shm_store[exp_id] = (shm.name, result.shape, result.dtype.str)
+                else:
+                    shm_store[exp_id] = (shm.name, result.shape, result.dtype.str)
                 shm.close()
-                exp_token_paths[exp_id] = f"shm://{shm_store[exp_id][0]}"
+                exp_token_paths[exp_id] = f"shm://{shm.name}"
             else:
                 exp_token_path = self._get_exp_token_path(exp_id)
                 np.save(exp_token_path, result)
@@ -723,49 +777,41 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             row_col_int = [int(v) for v in row_col_vals]
 
             if os.path.exists(cache_path):
-                data = np.load(cache_path)
-                token_data = data['tokens']
-                row_index = data['rows']
-                row_to_pos = {int(r): i for i, r in enumerate(row_index)}
+                with np.load(cache_path) as data:
+                    token_data = data['tokens']
+                    row_index = data['rows']
+                    row_to_pos = {int(r): i for i, r in enumerate(row_index)}
 
-                hit_rcv = [v for v in row_col_int if v in row_to_pos]
-                miss_rcv = [v for v in row_col_int if v not in row_to_pos]
+                    hit_rcv = [v for v in row_col_int if v in row_to_pos]
+                    miss_rcv = [v for v in row_col_int if v not in row_to_pos]
 
-                hit_tokens = None
-                miss_tokens = None
+                    hit_tokens = None
+                    miss_tokens = None
 
-                if hit_rcv:
-                    positions = np.array(
-                        [row_to_pos[v] for v in hit_rcv], dtype=np.int64
-                    )
-                    hit_tokens = torch.from_numpy(
-                        token_data[positions].astype(np.int64)
-                    )
-                    self._cache_hits += len(hit_rcv)
-
-                del data, token_data, row_index
+                    if hit_rcv:
+                        positions = np.array(
+                            [row_to_pos[v] for v in hit_rcv], dtype=np.int64
+                        )
+                        hit_tokens = torch.from_numpy(
+                            token_data[positions].astype(np.int64).copy()
+                        )
+                        self._cache_hits += len(hit_rcv)
 
                 if miss_rcv:
                     self._cache_misses += len(miss_rcv)
                     miss_rcv_arr = np.array(miss_rcv, dtype=np.int64)
 
+                    from quadmix.data.metadata_manager import _read_one_shard_texts_with_rows
                     schema = self.metadata_manager.schema
                     text_col = schema.text_col
                     row_col = schema.row_in_shard_col if self.metadata_manager._has_row_in_shard else None
+                    shard_total_rows = mgr._per_shard_info[sid]["num_docs"]
 
-                    if row_col is not None:
-                        df_shard = pd.read_parquet(
-                            shard_path,
-                            columns=[row_col, text_col],
-                            filters=[(row_col, "in", miss_rcv_arr.tolist())],
-                        )
-                        df_shard = df_shard.sort_values(row_col)
-                        selected_texts = df_shard[text_col].astype(str).tolist()
-                        parsed_rows = df_shard[row_col].to_numpy(dtype=np.int64)
-                    else:
-                        df_shard = pd.read_parquet(shard_path, columns=[text_col])
-                        selected_texts = df_shard[text_col].astype(str).tolist()
-                        parsed_rows = np.arange(len(selected_texts), dtype=np.int64)
+                    selected_texts, parsed_rows = _read_one_shard_texts_with_rows(
+                        shard_path, text_col, row_col, miss_rcv_arr,
+                        self.metadata_manager._has_row_in_shard,
+                        mgr._is_row_col_sequential, shard_total_rows,
+                    )
 
                     print(f"    [Partial miss] shard {sid}: "
                           f"tokenizing {len(miss_rcv):,} docs "
@@ -797,23 +843,18 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                     shard_tokens = hit_tokens
             else:
                 self._cache_misses += len(local_rows)
+                from quadmix.data.metadata_manager import _read_one_shard_texts_with_rows
                 schema = self.metadata_manager.schema
                 text_col = schema.text_col
                 row_col = schema.row_in_shard_col if self.metadata_manager._has_row_in_shard else None
+                row_col_arr = np.array(row_col_int, dtype=np.int64) if row_col is not None else None
+                shard_total_rows = mgr._per_shard_info[sid]["num_docs"]
 
-                if row_col is not None:
-                    df_shard = pd.read_parquet(
-                        shard_path,
-                        columns=[row_col, text_col],
-                        filters=[(row_col, "in", row_col_int)],
-                    )
-                    df_shard = df_shard.sort_values(row_col)
-                    selected_texts = df_shard[text_col].astype(str).tolist()
-                    parsed_rows = df_shard[row_col].to_numpy(dtype=np.int64)
-                else:
-                    df_shard = pd.read_parquet(shard_path, columns=[text_col])
-                    selected_texts = df_shard[text_col].astype(str).tolist()
-                    parsed_rows = np.arange(len(selected_texts), dtype=np.int64)
+                selected_texts, parsed_rows = _read_one_shard_texts_with_rows(
+                    shard_path, text_col, row_col, row_col_arr,
+                    self.metadata_manager._has_row_in_shard,
+                    mgr._is_row_col_sequential, shard_total_rows,
+                )
 
                 print(f"    [Cache miss] shard {sid}: "
                       f"tokenizing {len(selected_texts):,} docs...")
@@ -866,7 +907,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         )
         if os.path.exists(cache):
             print(f"[ProxyRunner] (legacy) Loading cached tokens: {cache}")
-            cached = torch.load(cache, map_location="cpu", weights_only=False)
+            cached = torch.load(cache, map_location="cpu", weights_only=True)
             self._token_ids = cached["token_ids"]
             self._token_counts = cached["token_counts"].numpy()
             print(f"[ProxyRunner] (legacy) Cached: {self._token_ids.shape}")
@@ -992,8 +1033,9 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         """Process one experiment: Eq.1-3 + sampling, domain-by-domain."""
         cancel = getattr(self, '_cancel_flag', None)
         M = self.config.num_domains
-        rng_eq2 = np.random.default_rng(experiment_id + 1729)
-        rng_sample = np.random.default_rng(experiment_id + 42)
+        so = self._seed_offset
+        rng_eq2 = np.random.default_rng(experiment_id + so + 1729)
+        rng_sample = np.random.default_rng(experiment_id + so + 42)
         has_tokens = hasattr(self, '_token_counts') and self._token_counts is not None
 
         domain_selected = []
@@ -1049,7 +1091,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         if domain_selected:
             return np.concatenate(domain_selected)
         else:
-            rng2 = np.random.default_rng(experiment_id + 42)
+            rng2 = np.random.default_rng(experiment_id + self._seed_offset + 42)
             return rng2.choice(np.arange(self._num_docs), 100, replace=False)
 
     def run_experiment(
@@ -1098,7 +1140,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 selected_idx_out = rng2.choice(self._train_idx, 100, replace=False)
 
             sampled_doc_count = len(selected_idx_out)
-            selected_idx_out = self._subsample_for_budget(selected_idx_out, seed=experiment_id)
+            selected_idx_out = self._subsample_for_budget(selected_idx_out, seed=experiment_id + self._seed_offset)
         else:
             selected_idx_out = np.asarray(selected_idx, dtype=np.int64)
 
@@ -1125,8 +1167,6 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 print(f"  [Exp {experiment_id:04d}] Model compiled with torch.compile")
             except Exception as e:
                 print(f"  [Exp {experiment_id:04d}] torch.compile failed: {e}, using eager mode")
-        elif self.device_type == "npu":
-            print(f"  [Exp {experiment_id:04d}] Skipping torch.compile (NPU not supported)")
 
         non_emb = model.count_params(non_embedding_only=True)
         print(f"  [Exp {experiment_id:04d}] Model on {device}: "
@@ -1150,6 +1190,10 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 real_tokens_list.append(eos_buf)
             flat_train = torch.cat(real_tokens_list)
             del train_tokens, real_tokens_list, real_mask, non_empty, eos_buf
+
+        with PerfTimer.section("data_to_device", _timer_prefix):
+            flat_train = flat_train.to(device)
+
         num_steps = self.tiny_steps if self.tiny_steps > 0 else self.max_step
         grad_acc = self.gradient_accumulation_steps
         max_iters = num_steps * grad_acc
@@ -1170,13 +1214,33 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         epoch = 0
 
         accum_bs = self.micro_batch_size * grad_acc
-        batch_buf = torch.empty(accum_bs, self.block_size + 1, dtype=torch.long, device=device)
+        inp_buf = torch.empty(accum_bs, self.block_size, dtype=torch.long, device=device)
+        tgt_buf = torch.empty(accum_bs, self.block_size, dtype=torch.long, device=device)
         block_starts_buf = torch.empty(accum_bs, dtype=torch.long, device=device)
-        arange_buf = torch.arange(self.block_size + 1, dtype=torch.long, device=device)
-        arange_cpu = torch.arange(self.block_size + 1, dtype=torch.long)
+        arange_npu = torch.arange(self.block_size, dtype=torch.long, device=device)
 
         if device.type == "npu":
-            torch.npu.empty_cache()
+            _safe_npu_empty_cache()
+
+        use_npu_graph = False
+        graphed_step = None
+        train_wrapper = None
+        if device.type == "npu":
+            torch.npu.synchronize()
+            try:
+                train_wrapper = GraphedTrainStep(model, 1024)
+                sample_inp = torch.zeros(self.micro_batch_size, self.block_size, dtype=torch.long, device=device)
+                sample_tgt = torch.zeros(self.micro_batch_size, self.block_size, dtype=torch.long, device=device)
+                graphed_step = torch.npu.make_graphed_callables(
+                    train_wrapper, sample_args=(sample_inp, sample_tgt), num_warmup_iters=3,
+                )
+                use_npu_graph = True
+                print(f"  [Exp {experiment_id:04d}] NPUGraph enabled (forward+backward captured)")
+                del sample_inp, sample_tgt
+            except Exception as e:
+                use_npu_graph = False
+                graphed_step = None
+                print(f"  [Exp {experiment_id:04d}] NPUGraph failed: {e}, using eager mode")
 
         _train_t0 = time.perf_counter()
         model.train()
@@ -1216,17 +1280,18 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                         filled += chunk
                         epoch_pos = chunk
 
-                block_starts_cpu_tensor = torch.from_numpy(block_starts_cpu)
-                idx_cpu = block_starts_cpu_tensor.unsqueeze(1) + arange_cpu.unsqueeze(0)
-                batch_cpu = flat_train[idx_cpu]
-                batch_buf.copy_(batch_cpu.to(device))
+                block_starts_buf.copy_(torch.from_numpy(block_starts_cpu))
+                inp_buf.copy_(flat_train[block_starts_buf.unsqueeze(1) + arange_npu.unsqueeze(0)])
+                tgt_buf.copy_(flat_train[(block_starts_buf + 1).unsqueeze(1) + arange_npu.unsqueeze(0)])
 
-            batch = batch_buf[mb_start:mb_end]
-            inp = batch[:, :self.block_size].contiguous()
-            tgt = batch[:, 1:self.block_size + 1].contiguous()
+            inp = inp_buf[mb_start:mb_end]
+            tgt = tgt_buf[mb_start:mb_end]
 
-            hidden = model(inp, return_hidden=True)
-            loss = chunked_loss_from_hidden(model, hidden, tgt, chunk_size=2048)
+            if use_npu_graph:
+                loss = graphed_step(inp, tgt)
+            else:
+                hidden = model(inp, return_hidden=True)
+                loss = chunked_loss_from_hidden(model, hidden, tgt, chunk_size=1024)
 
             is_acc = (iter_ct + 1) % grad_acc != 0
             (loss / grad_acc).backward()
@@ -1237,12 +1302,12 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                     pg["lr"] = lr
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=not use_npu_graph)
                 step_ct += 1
 
                 if checkpoint_interval > 0 and step_ct % checkpoint_interval == 0 and step_ct < num_steps:
                     if device.type == "npu":
-                        torch.npu.empty_cache()
+                        _safe_npu_empty_cache()
                     elif device.type == "cuda":
                         torch.cuda.empty_cache()
                     ckpt_val, _ = self._run_validation(model, device)
@@ -1265,11 +1330,15 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         PerfTimer._timings.setdefault(f"{_timer_prefix}.training_loop", []).append(_train_elapsed)
 
         with PerfTimer.section("free_resources", _timer_prefix):
-            del flat_train, batch_buf, block_starts_buf, arange_buf, optimizer, perm
+            if use_npu_graph:
+                del graphed_step, train_wrapper
+                if device.type == "npu":
+                    torch.npu.synchronize()
+            del flat_train, inp_buf, tgt_buf, block_starts_buf, arange_npu, optimizer, perm
             if device.type == "npu":
                 import gc as _gc
                 _gc.collect()
-                torch.npu.empty_cache()
+                _safe_npu_empty_cache()
             elif device.type == "cuda":
                 import gc as _gc
                 _gc.collect()
@@ -1281,10 +1350,10 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         with PerfTimer.section("save_metadata", _timer_prefix):
             avg_train = (loss_accum / iter_ct).item() if iter_ct > 0 else 0
 
-            domain_names = self._domain_names or [f"domain_{m}" for m in range(M)]
-            quality_names = self._quality_names or [f"criterion_{n}" for n in range(N)]
             M = params.num_domains
             N = params.num_criteria
+            domain_names = self._domain_names or [f"domain_{m}" for m in range(M)]
+            quality_names = self._quality_names or [f"criterion_{n}" for n in range(N)]
             dw = params.merge_config.domain_weights
 
             quality_weights = {}
@@ -1340,7 +1409,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 meta["per_task_losses"] = per_task_losses
             np.save(os.path.join(exp_dir, "selected_indices.npy"), selected_idx_out)
             with open(os.path.join(exp_dir, "meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
+                json.dump(sanitize_for_json(meta), f, indent=2)
             torch.save(model.state_dict(), os.path.join(exp_dir, "model.pt"))
 
             ckpt_results = dict(self._ckpt_results) if hasattr(self, '_ckpt_results') else {}
@@ -1354,7 +1423,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 }
                 ckpt_path = os.path.join(exp_dir, "checkpoint_trajectory.json")
                 with open(ckpt_path, "w") as f:
-                    json.dump(ckpt_trajectory, f, indent=2)
+                    json.dump(sanitize_for_json(ckpt_trajectory), f, indent=2)
 
         print(f"  [Exp {experiment_id:04d}] Done. train_loss={avg_train:.4f}, "
               f"val_loss={val_loss:.4f} (ppl={np.exp(val_loss):.1f})")
@@ -1363,7 +1432,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             if device.type == "npu":
                 import gc
                 gc.collect()
-                torch.npu.empty_cache()
+                _safe_npu_empty_cache()
 
         return ProxyResult(parameters=params, validation_loss=val_loss, metadata=meta, per_task_losses=per_task_losses)
 
@@ -1422,7 +1491,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         
         del val_tokens, val_mask, per_doc_losses, all_losses
         if device.type == "npu":
-            torch.npu.empty_cache()
+            _safe_npu_empty_cache()
         elif device.type == "cuda":
             torch.cuda.empty_cache()
         model.train()
@@ -1445,7 +1514,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         if device.type == "npu":
             import gc
             gc.collect()
-            torch.npu.empty_cache()
+            _safe_npu_empty_cache()
         elif device.type == "cuda":
             torch.cuda.empty_cache()
         return val_loss, per_task_losses
@@ -1592,7 +1661,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             "std_val_loss": float(np.std([r.validation_loss for r in results])),
         }
         with open(path, "w") as f:
-            json.dump(summary, f, indent=2)
+            json.dump(sanitize_for_json(summary), f, indent=2)
         print(f"[ProxyRunner] Summary: {path}")
 
     def precompute_samples(
@@ -1605,13 +1674,16 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         t0 = time.time()
         n = len(all_params)
         num_cpus = cfg.cpu_count
+        seed_offset = self._seed_offset
 
+        q_cols = self._normalized_quality.shape[1]
+        q_itemsize = self._normalized_quality.dtype.itemsize
         shm_data_size = (
-            self._normalized_quality.nbytes
+            sum(len(idx) * q_cols * q_itemsize for idx in self._domain_indices.values())
             + sum(idx.nbytes for idx in self._domain_indices.values())
         )
         if self._token_counts is not None:
-            shm_data_size += self._token_counts.nbytes
+            shm_data_size += sum(len(idx) * self._token_counts.dtype.itemsize for idx in self._domain_indices.values())
         n_m_max = max((len(idx) for idx in self._domain_indices.values()), default=self._num_docs)
         compute_mem = 6 * n_m_max * 8
         mem_per_process = compute_mem + 50 * 1024**2
@@ -1635,28 +1707,38 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         )
 
         shm_blocks = []
-        nq_info = ndarray_to_shared(self._normalized_quality, "presample_nq")
-        shm_blocks.append(nq_info.name)
+        sq_infos = {}
+        t_pre = time.time()
+        for m, idx in self._domain_indices.items():
+            sub_q = np.ascontiguousarray(self._normalized_quality[idx])
+            info = ndarray_to_shared(sub_q, f"presample_sq_{m}")
+            sq_infos[m] = info
+            shm_blocks.append(info.name)
         di_infos = {}
         for m, idx in self._domain_indices.items():
             info = ndarray_to_shared(idx, f"presample_di_{m}")
             di_infos[m] = info
             shm_blocks.append(info.name)
         has_tc = self._token_counts is not None
+        stc_infos = {}
         if has_tc:
-            tc_info = ndarray_to_shared(self._token_counts, "presample_tc")
-            shm_blocks.append(tc_info.name)
-        else:
-            tc_info = None
+            for m, idx in self._domain_indices.items():
+                sub_tc = np.ascontiguousarray(self._token_counts[idx])
+                info = ndarray_to_shared(sub_tc, f"presample_stc_{m}")
+                stc_infos[m] = info
+                shm_blocks.append(info.name)
+        pre_elapsed = time.time() - t_pre
+        print(f"[PreSample] Pre-extraction (contiguous per-domain): {pre_elapsed:.1f}s")
 
         data = _PreSampleData(
-            normalized_quality_info=nq_info,
+            sub_quality_infos=sq_infos,
             domain_indices_infos=di_infos,
-            token_counts_info=tc_info,
+            sub_token_counts_infos=stc_infos,
             has_token_counts=has_tc,
             num_domains=self.config.num_domains,
             rank_ref_size=self.rank_ref_size,
             num_docs=self._num_docs,
+            seed_offset=seed_offset,
         )
 
         orig_env = {}
@@ -1723,7 +1805,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         total_train_docs = 0
         total_sampled_docs = 0
         for i, sel in enumerate(all_selected):
-            train_sel = self._subsample_for_budget(sel, seed=i)
+            train_sel = self._subsample_for_budget(sel, seed=i + seed_offset)
             all_selected_train.append(train_sel)
             total_train_docs += len(train_sel)
             total_sampled_docs += len(sel)
@@ -1791,7 +1873,9 @@ class EssentialWebProxyRunner(BaseProxyRunner):
 
                 if miss_row_col:
                     miss_row_col_arr = np.array(sorted(miss_row_col), dtype=np.int64)
-                    shard_miss_info.append((sid, shard_path, miss_row_col_arr.tolist()))
+                    shard_total_rows = mgr._per_shard_info[sid]["num_docs"]
+                    shard_miss_info.append((sid, shard_path, miss_row_col_arr.tolist(),
+                                           mgr._is_row_col_sequential, shard_total_rows))
                     shard_miss_meta[sid] = len(miss_row_col)
 
         if shard_miss_info:
@@ -1804,6 +1888,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                     text_col=schema.text_col,
                     row_in_shard_col=schema.row_in_shard_col,
                     has_row_in_shard=self.metadata_manager._has_row_in_shard,
+                    is_row_col_sequential=self.metadata_manager._is_row_col_sequential,
                 )
 
             with PerfTimer.section("cache_results", "tokenize_all"):
@@ -1819,9 +1904,11 @@ class EssentialWebProxyRunner(BaseProxyRunner):
 
         pack_t0 = time.time()
         shard_starts = mgr._shard_starts
+        with self._memory_cache_lock:
+            cache_snapshot2 = list(self._memory_cache.items())
         global_ids_list = []
         tokens_list = []
-        for sid, cache_data in self._memory_cache.items():
+        for sid, cache_data in cache_snapshot2:
             rows = cache_data["rows"]
             tokens = cache_data["tokens"]
             seq_positions = mgr.row_col_to_local(sid, rows)
@@ -1837,8 +1924,9 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         del global_ids_list, tokens_list
 
         freed_gb = self._memory_cache_bytes / (1024 ** 3)
-        self._memory_cache.clear()
-        self._memory_cache_bytes = 0
+        with self._memory_cache_lock:
+            self._memory_cache.clear()
+            self._memory_cache_bytes = 0
         print(f"[TokenizeAll] Concatenated, freed {freed_gb:.1f} GB from memory cache. "
               f"Sorting global IDs...", flush=True)
 
@@ -1986,6 +2074,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
         completed_count = 0
 
         exp_shm_info: Dict[int, tuple] = {}
+        exp_shm_lock = threading.Lock()
 
         all_selected_train = getattr(self, '_all_selected_train', all_selected)
 
@@ -2022,7 +2111,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 try:
                     exp_token_paths = self._tokenize_batch_union(
                         batch_selected, batch_ids, async_write_queue,
-                        shm_store=exp_shm_info,
+                        shm_store=exp_shm_info, shm_lock=exp_shm_lock,
                     )
                     batch_count += 1
 
@@ -2086,7 +2175,8 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                 with ready_cond:
                     is_ready = ready_events.get(pos, None)
                     if is_ready is True:
-                        shm_info = exp_shm_info.get(pos)
+                        with exp_shm_lock:
+                            shm_info = exp_shm_info.get(pos)
                         task_item = (
                             pos, params_list[pos],
                             all_selected_train[pos], shm_info,
@@ -2176,25 +2266,7 @@ class EssentialWebProxyRunner(BaseProxyRunner):
                     if completed_count % 50 == 0 or completed_count == n_exp:
                         print(f"[Collector] {completed_count}/{n_exp} done ({elapsed:.0f}s, ETA: {eta:.0f}s)")
                 except thread_queue.Empty:
-                    if time.time() - last_progress_time > 60:
-                        all_dead = (len(worker_processes) > 0 and
-                                    all(not p.is_alive() for p in worker_processes))
-                        if all_dead:
-                            missing = [i for i in range(n_exp) if all_results[i] is None]
-                            print(f"[Collector] All workers dead; {completed_count}/{n_exp} results, "
-                                  f"{len(missing)} missing")
-                            for eid in missing:
-                                all_results[eid] = ProxyResult(
-                                    parameters=params_list[eid],
-                                    validation_loss=float('inf'),
-                                    metadata={"experiment_id": eid, "error": "worker_crash"}
-                                )
-                                completed_count += 1
-                            break
-                        alive_count = sum(1 for p in worker_processes if p.is_alive())
-                        print(f"[Collector] No progress for 60s; {alive_count}/{len(worker_processes)} workers alive, "
-                              f"{completed_count}/{n_exp} results")
-                        last_progress_time = time.time()
+                    pass
                 except Exception as e:
                     print(f"[Collector] Unexpected error: {e}")
 
@@ -2250,7 +2322,9 @@ class EssentialWebProxyRunner(BaseProxyRunner):
             print(f"[SharedMem] Cleaned up {len(shared_meta)} metadata blocks")
 
         leaked = 0
-        for exp_id, (shm_name, shape, dtype_str) in exp_shm_info.items():
+        with exp_shm_lock:
+            items = list(exp_shm_info.items())
+        for exp_id, (shm_name, shape, dtype_str) in items:
             try:
                 shm = mp.shared_memory.SharedMemory(name=shm_name)
                 shm.close()

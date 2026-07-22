@@ -68,26 +68,22 @@ def compute_quality_ranks(
             ranks[indices] = 0.5  # Edge case: all tokens 0
             continue
 
-        # Sort by merged quality (descending: best quality first)
-        sort_order = np.argsort(-domain_scores)
-
-        # Compute cumulative token percentage (token-weighted percentile)
-        # For each document, ¯r = (cumulative tokens for same or better quality) / total tokens
-        # Per paper: |{x | d_x = m, ¯q_x >= ¯q}|
+        sort_order = np.argsort(-domain_scores, kind='mergesort')
+        sorted_scores = domain_scores[sort_order]
         sorted_tokens = domain_tokens[sort_order]
         cumulative = np.cumsum(sorted_tokens)
 
-        # Map back to original order
-        # The rank for document i at sorted position pos is cumulative[pos] / total
-        # Since cumulative[pos] includes document itself (¯q_x >= ¯q)
-        sorted_ranks = cumulative / total_tokens
+        tied_ranks = np.empty(len(domain_scores), dtype=np.float64)
+        i = 0
+        while i < len(sorted_scores):
+            j = i + 1
+            while j < len(sorted_scores) and sorted_scores[j] == sorted_scores[i]:
+                j += 1
+            group_rank = cumulative[j - 1] / total_tokens
+            tied_ranks[i:j] = group_rank
+            i = j
 
-        # Per paper: ¯r = |{x | d_x = m, ¯q_x >= ¯q}| / |{x | d_x = m}|
-        # The set includes the document itself, so cumulative[t] / total is correct.
-        # Best document has ¯r ≈ tokens_of_best / total (very small but > 0)
-
-        # Map sorted positions back to original indices
         inv_sort = np.argsort(sort_order)
-        ranks[indices] = sorted_ranks[inv_sort]
+        ranks[indices] = tied_ranks[inv_sort]
 
     return ranks

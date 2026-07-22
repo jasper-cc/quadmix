@@ -174,16 +174,40 @@ must specify `--schema`. See `configs/schema_essential_web.yaml` as a reference.
 ### Example: STEM dataset config
 
 ```yaml
-# configs/schema_stem.yaml
-domain_col: category_name            # string column → auto int mapping
-quality_cols:
-  - category_score                    # higher_better=true (default)
+# configs/schema_stem.yaml — actual config (copy and modify for your dataset)
+domain_col: category_name            # string column → auto int mapping via domain_names
+domain_names:                        # controls string→int mapping order (数学=0, 化学=1, ...)
+  - 数学
+  - 化学
+  - 生物学
+  - 物理
+
+quality_cols:                        # all default to higher_better=true
+  - stem_relevance                   #   (pre-processed: higher score = better quality)
+  - knowledge_value
+  - notation_fidelity
+  - rigor_coherence
+  - noise_level                      #   (pre-processed: higher score = less noise = better)
+
+quality_names:                       # display names in reports/figures (optional, defaults to col names)
   - stem_relevance
-  - name: noise_level                 # lower noise is better
+  - knowledge_value
+  - notation_fidelity
+  - rigor_coherence
+  - noise_level
+
+text_col: text                       # document text column
+char_count_col: char_count_col       # pre-computed token proxy (null → compute from text)
+row_in_shard_col: source_record_idx  # explicit row indexing (null → positional)
+```
+
+For quality columns where lower scores mean better quality, use the dict syntax:
+
+```yaml
+quality_cols:
+  - stem_relevance                   # higher_better=true (default)
+  - name: noise_level                # override: lower score = better quality
     higher_better: false
-text_col: content
-char_count_col: null                  # compute from text length
-row_in_shard_col: null                # positional text reading
 ```
 
 ### Then run:
