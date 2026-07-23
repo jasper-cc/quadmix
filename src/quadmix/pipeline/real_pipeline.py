@@ -98,14 +98,15 @@ class QuaDMixPipeline:
         self._data: Optional[UnifiedData] = None
         self._texts: Optional[List[str]] = None
         self._dataset_size_prediction: Optional[Dict[str, Any]] = None
+        self._negated_cols: List[int] = []
 
     # ── Public config ──────────────────────────────────────────
 
     def set_quality_scorers(self, scorers: List):
         """Set quality scorers for normal mode."""
-        if len(scorers) != self.config.num_quality_criteria:
+        if len(scorers) != self.config.num_criteria:
             raise ValueError(
-                f"Expected {self.config.num_quality_criteria} scorers, got {len(scorers)}"
+                f"Expected {self.config.num_criteria} scorers, got {len(scorers)}"
             )
         self._quality_scorers = scorers
 
@@ -154,7 +155,7 @@ class QuaDMixPipeline:
             domain_col = self._schema.domain_col
         if quality_cols is None:
             quality_cols = self._schema.quality_cols
-        expected_n = self.config.num_quality_criteria
+        expected_n = self.config.num_criteria
         if len(quality_cols) != expected_n:
             raise ValueError(
                 f"Expected {expected_n} quality columns, got {len(quality_cols)}"
@@ -180,7 +181,7 @@ class QuaDMixPipeline:
         print(f"  Documents: {len(self._texts):,}")
         print(f"  Domains:   {self.config.num_domains} "
               f"({len(np.unique(self._domain_labels))} present)")
-        print(f"  Criteria:  {self.config.num_quality_criteria}")
+        print(f"  Criteria:  {self.config.num_criteria}")
         print(f"  Tokens:    {token_counts.sum():,} (estimated)")
 
         return self._texts, self._domain_labels, self._quality_scores, token_counts
@@ -211,10 +212,12 @@ class QuaDMixPipeline:
         self._texts = None
 
         quality_directions = self._quality_directions if hasattr(self, '_quality_directions') else metadata_manager.quality_directions
+        self._negated_cols = []
         if quality_directions:
             for n, hb in enumerate(quality_directions):
                 if not hb:
                     self._quality_scores[:, n] = -self._quality_scores[:, n]
+                    self._negated_cols.append(n)
 
         n = metadata_manager.num_docs
         if doc_limit and doc_limit < n:
@@ -231,7 +234,7 @@ class QuaDMixPipeline:
         print(f"  Documents: {n:,}")
         print(f"  Domains:   {self.config.num_domains} "
               f"({len(np.unique(self._domain_labels))} present)")
-        print(f"  Criteria:  {self.config.num_quality_criteria}")
+        print(f"  Criteria:  {self.config.num_criteria}")
         print(f"  [Sharded] Text will be loaded on-demand from {metadata_manager.num_shards} shards")
 
         return None, self._domain_labels, self._quality_scores, token_counts
@@ -288,7 +291,7 @@ class QuaDMixPipeline:
     ) -> np.ndarray:
         """Compute merged quality scores and ranks (Eq.1 & Eq.2)."""
         if merge_config is None:
-            N = self.config.num_quality_criteria
+            N = self.config.num_criteria
             M = self.config.num_domains
             global_weights = np.ones(N, dtype=np.float64) / N
             domain_weights = np.tile(global_weights, M)
@@ -319,6 +322,7 @@ class QuaDMixPipeline:
     def run(
         self,
         data_path: str,
+        schema: DatasetSchema,
         output_dir: str = "./quadmix_output",
         num_experiments: Optional[int] = None,
         num_search: Optional[int] = None,
@@ -334,7 +338,6 @@ class QuaDMixPipeline:
         quality_directions: Optional[List[bool]] = None,
         parallel_workers: int = 1,
         val_set: Optional[str] = None,
-        schema: Optional[DatasetSchema] = None,
         **load_kwargs,
     ) -> PipelineOutput:
         """Run the complete QuaDMix pipeline."""
@@ -349,8 +352,6 @@ class QuaDMixPipeline:
 
         stage_times: Dict[str, float] = {}
 
-        if schema is None:
-            schema = DatasetSchema()
         self._schema = schema
         if text_col is None:
             text_col = schema.text_col
@@ -467,7 +468,7 @@ class QuaDMixPipeline:
             elapsed_seconds=elapsed,
             config={
                 "num_domains": self.config.num_domains,
-                "num_quality_criteria": self.config.num_quality_criteria,
+                "num_quality_criteria": self.config.num_criteria,
             },
         )
 
@@ -666,7 +667,7 @@ class QuaDMixPipeline:
         summary = {
             "config": {
                 "num_domains": self.config.num_domains,
-                "num_quality_criteria": self.config.num_quality_criteria,
+                "num_quality_criteria": self.config.num_criteria,
                 "num_proxy_experiments": n_exp,
                 "num_search_points": n_search,
                 "normalizer": normalizer,
@@ -712,37 +713,33 @@ class QuaDMixPipeline:
             json.dump(sanitize_for_json(summary), f, indent=2)
 
         if text_source == "sharded":
-            print(f"[Stage 8] Reading {len(selected_indices):,} sampled texts from shards...")
-            sampled_texts = self._metadata_manager.read_texts(selected_indices)
-            sel_domain = domain_labels[selected_indices]
-            sel_rank = final_ranks[selected_indices]
-            sel_sv = sampling_values[selected_indices]
-            sel_weights = 1.0 / np.maximum(sel_sv, 1e-10)
-
-            sampled_path = os.path.join(output_dir, "sampled_dataset.parquet")
-            os.makedirs(os.path.dirname(sampled_path) or ".", exist_ok=True)
-            schema = self._schema
-            print(f"[Stage 8] Writing sampled dataset to parquet ({len(selected_indices):,} rows)...")
-            pd.DataFrame({
-                schema.text_col: sampled_texts,
-                "doc_id": selected_indices,
-                schema.domain_col: sel_domain,
-                "quality_rank": sel_rank,
-                "sampling_weight": sel_weights,
-                "sampling_value": sel_sv,
-            }).to_parquet(sampled_path, index=False)
-            print(f"[Stage 8] Sampled dataset saved (sharded): {sampled_path}")
-        else:
+            print(f"[Stage 8] Saving {len(selected_indices):,} sampled documents...")
             sampled_path = os.path.join(output_dir, "sampled_dataset.parquet")
             schema = self._schema
             save_sampled_dataset(
-                original_texts=texts,
+                get_text_fn=self._metadata_manager.read_texts,
+                num_total_docs=len(domain_labels),
                 selected_indices=selected_indices,
                 output_path=sampled_path,
                 domain_labels=domain_labels,
                 quality_ranks=final_ranks,
                 sampling_values=sampling_values,
-                doc_ids=np.arange(len(texts)),
+                format=output_format,
+                text_col=schema.text_col,
+                domain_col=schema.domain_col,
+            )
+        else:
+            sampled_path = os.path.join(output_dir, "sampled_dataset.parquet")
+            schema = self._schema
+            texts_ref = texts
+            save_sampled_dataset(
+                get_text_fn=lambda idx: [texts_ref[i] for i in idx],
+                num_total_docs=len(texts),
+                selected_indices=selected_indices,
+                output_path=sampled_path,
+                domain_labels=domain_labels,
+                quality_ranks=final_ranks,
+                sampling_values=sampling_values,
                 format=output_format,
                 text_col=schema.text_col,
                 domain_col=schema.domain_col,
@@ -765,7 +762,7 @@ class QuaDMixPipeline:
             domain_labels=domain_labels,
             token_counts=token_counts,
             num_domains=self.config.num_domains,
-            num_criteria=self.config.num_quality_criteria,
+            num_criteria=self.config.num_criteria,
             config=summary["config"],
             metrics=summary["metrics"],
             elapsed=elapsed,

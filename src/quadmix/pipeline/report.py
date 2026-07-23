@@ -7,7 +7,8 @@ markdown ![](filename.png) syntax — supported by all MD viewers.
 import json
 import os
 import time
-from typing import List, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import unicodedata
 
@@ -25,8 +26,20 @@ from quadmix.constants import DOMAIN_SHORT_NAMES
 _CJK_FONT_AVAILABLE = False
 
 
+_CJK_FONT_PATH = None
+
+
 def _str_has_cjk(s):
     return any(unicodedata.category(c) == 'Lo' for c in str(s))
+
+
+def _get_bundled_font_path():
+    p = Path(__file__).parent.parent / "assets" / "fonts"
+    for candidate in p.glob("*.otf"):
+        return str(candidate)
+    for candidate in p.glob("*.ttf"):
+        return str(candidate)
+    return None
 
 
 def _get_domain_short(num_domains, domain_names=None):
@@ -41,6 +54,16 @@ def _get_domain_short(num_domains, domain_names=None):
         return DOMAIN_SHORT_NAMES[:num_domains]
     return DOMAIN_SHORT_NAMES + [f"D{i}" for i in range(len(DOMAIN_SHORT_NAMES), num_domains)]
 
+
+def _get_domain_display(num_domains, domain_names=None):
+    if domain_names is not None:
+        names = [str(n) for n in domain_names[:num_domains]]
+        if num_domains > len(domain_names):
+            names += [f"domain_{i}" for i in range(len(domain_names), num_domains)]
+        return names
+    return _get_domain_short(num_domains, domain_names)
+
+
 _DEFAULT_QUALITY_NAMES = ["DCLM", "FineWeb-Edu", "English", "Math (Gen)", "Math (OpenWeb)"]
 _DEFAULT_QUALITY_SHORT = ["DCLM", "Edu", "Eng", "MathG", "MathO"]
 
@@ -54,6 +77,7 @@ _CJK_TEST_CHAR = '\u6570'
 
 
 def _find_cjk_font():
+    global _CJK_FONT_PATH
     fm = matplotlib.font_manager
     from matplotlib.ft2font import FT2Font
     for f in fm.fontManager.ttflist:
@@ -66,6 +90,18 @@ def _find_cjk_font():
                 return f.name
         except Exception:
             continue
+    bundled = _get_bundled_font_path()
+    if bundled and os.path.exists(bundled):
+        try:
+            fm.fontManager.addfont(bundled)
+            ft = FT2Font(bundled)
+            cmap = ft.get_charmap()
+            gid = cmap.get(ord(_CJK_TEST_CHAR))
+            if gid is not None and gid != 0:
+                _CJK_FONT_PATH = bundled
+                return ft.family_name or "Noto Sans CJK SC"
+        except Exception:
+            pass
     return None
 
 
@@ -195,7 +231,7 @@ def _experiment_table(exp_outputs_dir, data_path, num_domains=22, top_k=50,
         return "*(no experiment data)*"
 
     rows = []
-    domain_short = _get_domain_short(num_domains, domain_names)
+    domain_display = _get_domain_display(num_domains, domain_names)
     for exp_dir_name in exp_dirs[:top_k]:
         exp_dir = os.path.join(exp_outputs_dir, exp_dir_name)
         meta_path = os.path.join(exp_dir, "meta.json")
@@ -209,7 +245,7 @@ def _experiment_table(exp_outputs_dir, data_path, num_domains=22, top_k=50,
         dist /= max(1, dist.sum())
         top5 = sorted(range(num_domains), key=lambda m: dist[m], reverse=True)[:5]
         top5_cells = " ".join(
-            f"**{domain_short[m]}** {dist[m]*100:.0f}%"
+            f"**{domain_display[m]}** {dist[m]*100:.0f}%"
             for m in top5 if dist[m] > 0.01
         )
         val_loss = "?"
@@ -568,6 +604,27 @@ def generate_report(
         f"- **最优采样总 tokens:** {int(sel_tokens):,}",
         f"- **采样比例 (docs):** {len(optimal_selected_indices) / max(1, len(domain_labels)):.4f}x",
         f"- **采样比例 (tokens):** {int(sel_tokens) / max(1, int(token_counts.sum())):.4f}x",
+    ]
+
+    if not _CJK_FONT_AVAILABLE and domain_names is not None:
+        has_cjk = any(_str_has_cjk(n) for n in domain_names[:num_domains])
+        if has_cjk:
+            domain_short = _get_domain_short(num_domains, domain_names)
+            domain_disp = _get_domain_display(num_domains, domain_names)
+            pairs = []
+            for i in range(min(num_domains, len(domain_short), len(domain_disp))):
+                if domain_short[i] != domain_disp[i]:
+                    pairs.append((domain_short[i], domain_disp[i]))
+            if pairs:
+                parts.append("")
+                parts.append("> **Note:** PNG figures use D{i} labels because no CJK font was found. "
+                             "See the mapping below.\n")
+                parts.append("| PNG Label | Domain Name |")
+                parts.append("|:---------:|:------------|")
+                for short, full in pairs:
+                    parts.append(f"| {short} | {full} |")
+
+    parts += [
         "",
         "---\n",
         "## Figure 1: 域分布对比\n",

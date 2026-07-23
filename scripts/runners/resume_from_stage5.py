@@ -369,7 +369,7 @@ def main():
         domain_labels=domain_labels,
         token_counts=token_counts,
         num_domains=config.num_domains,
-        num_criteria=config.num_quality_criteria,
+        num_criteria=config.num_criteria,
         config=summary["config"],
         metrics=summary["metrics"],
         elapsed=elapsed,

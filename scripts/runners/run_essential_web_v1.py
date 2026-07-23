@@ -268,9 +268,9 @@ def build_parser():
                    help="Desired max tokens in output (in B). θ* may produce less; "
                         "if more, uniformly discard to preserve distribution. "
                         "Paper: 'more tokens not always good' (30B > 90B > 180B)")
-    p.add_argument("--search-mode", default="r2_sigma_weighted",
+    p.add_argument("--search-mode", default="r2_weighted",
                    choices=["r2_weighted", "equal_weight", "r2_sigma_weighted"],
-                   help="Search weighting mode (default: r2_sigma_weighted)")
+                   help="Search weighting mode (default: r2_weighted)")
     p.add_argument("--device-type", default="cpu",
                    choices=["cpu", "cuda", "npu"],
                    help="Device type for proxy model training")
@@ -278,8 +278,8 @@ def build_parser():
                    help="Number of NPU devices (1=sequential, 8=8-way parallel)")
 
     # Proxy model config
-    p.add_argument("--block-size", type=int, default=64,
-                   help="Sequence length (tokens). Full paper: 2048")
+    p.add_argument("--block-size", type=int, default=2048,
+                   help="Sequence length (tokens). Paper default: 2048")
     p.add_argument("--tiny-steps", type=int, default=3,
                    help="Proxy training steps (0 = use max_step=25000)")
     p.add_argument("--micro-batch-size", type=int, default=2,
@@ -288,8 +288,6 @@ def build_parser():
                    help="Effective global batch size (grad acc = global/micro)")
     p.add_argument("--rank-ref-size", type=int, default=10000,
                    help="Reference subset size for rank estimation")
-    p.add_argument("--checkpoint-steps", type=str, default=None,
-                   help="[DEPRECATED] Use --checkpoint-interval instead.")
     p.add_argument("--checkpoint-interval", type=int, default=1000,
                    help="Record val_loss every N steps during proxy training "
                         "(default: 1000, 0 = disable). "

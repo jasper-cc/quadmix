@@ -222,15 +222,14 @@ class QuaDMixConfig:
     """
     Top-level configuration for a QuaDMix run.
     """
-    # Data configuration
     num_domains: int                # M — number of domains
-    num_quality_criteria: int       # N — number of quality scorers
+    num_quality_criteria: Optional[int] = None  # N — auto-derived from schema.quality_cols if None
 
     # Experiment configuration
-    num_proxy_experiments: int = 3000        # Number of proxy experiments (paper: 3000)
-    num_search_points: int = 100000          # Number of points for optimal search (paper: 100000)
-    top_k_average: int = 10                  # Average top-K candidates (paper: 10)
-    search_weight_mode: str = "equal_weight"  # "equal_weight", "r2_weighted", or "r2_sigma_weighted"
+    num_proxy_experiments: int = 3000
+    num_search_points: int = 100000
+    top_k_average: int = 10
+    search_weight_mode: str = "r2_weighted"
 
     # Sampling bounds (paper defaults)
     lambda_min: float = 0.0
@@ -270,9 +269,23 @@ class QuaDMixConfig:
     #          Useful for debugging or controlled A/B comparisons.
     seed: Optional[int] = None
 
+    def __post_init__(self):
+        if self.num_quality_criteria is not None and self.num_quality_criteria <= 0:
+            raise ValueError(f"num_quality_criteria must be positive, got {self.num_quality_criteria}")
+
+    @property
+    def num_criteria(self) -> int:
+        """N — number of quality criteria. Raises if not set (must derive from schema)."""
+        if self.num_quality_criteria is None:
+            raise ValueError(
+                "num_quality_criteria not set. Must be derived from schema.quality_cols "
+                "or passed explicitly."
+            )
+        return self.num_quality_criteria
+
     def get_domain_param_dim(self) -> int:
         """Parameter dimension per domain: (N + 4)"""
-        return self.num_quality_criteria + 4
+        return self.num_criteria + 4
 
     def total_param_dim(self) -> int:
         """Total parameter dimension: (N + 4) × M"""

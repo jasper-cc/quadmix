@@ -524,7 +524,7 @@ class QuaDMixOptimizer:
             train_params,
             train_losses,
             num_domains=self.config.num_domains,
-            num_criteria=self.config.num_quality_criteria,
+            num_criteria=self.config.num_criteria,
             eval_params_list=val_params if n_val > 0 else None,
             eval_losses=val_losses if n_val > 0 else None,
         )
@@ -603,7 +603,7 @@ class QuaDMixOptimizer:
         # Create folds for CV
         folds = None
         if n_folds > 1 and n_total >= n_folds:
-            rng = np.random.RandomState(42)
+            rng = np.random.default_rng(42)
             indices = np.arange(n_total)
             rng.shuffle(indices)
             folds = np.array_split(indices, n_folds)
@@ -625,7 +625,7 @@ class QuaDMixOptimizer:
                 n_folds=n_folds,
                 regression_params=regression_params_nested,
                 num_domains=self.config.num_domains,
-                num_quality_criteria=self.config.num_quality_criteria,
+                num_quality_criteria=self.config.num_criteria,
             )
             for task in valid_tasks
         )
@@ -842,7 +842,7 @@ class QuaDMixOptimizer:
                 losses=losses,
                 n_features=n_features,
                 num_domains=self.config.num_domains,
-                num_criteria=self.config.num_quality_criteria,
+                num_criteria=self.config.num_criteria,
                 regression_params=regression_params_nested,
             )
             for i in range(n_bootstrap)
@@ -956,7 +956,7 @@ class QuaDMixOptimizer:
         top_indices = np.argsort(predicted_losses)[:k]
 
         # Average top-K to get final parameters
-        N, M = self.config.num_quality_criteria, self.config.num_domains
+        N, M = self.config.num_criteria, self.config.num_domains
         avg_arr = np.mean([candidates[i].flatten() for i in top_indices], axis=0)
         optimal_params = ParameterSet.from_flattened(avg_arr, M, N)
 

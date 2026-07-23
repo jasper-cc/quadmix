@@ -394,14 +394,9 @@ def _worker_dynamic_loop(
             result_queue.put(r)
             completed += 1
 
-            if device_type == "npu":
-                torch.npu.synchronize()
             gc.collect()
             if device_type == "npu":
-                try:
-                    torch.npu.empty_cache()
-                except Exception:
-                    pass
+                torch.npu.empty_cache()
 
             if shm_info is not None:
                 from multiprocessing.shared_memory import SharedMemory
@@ -446,11 +441,8 @@ def _worker_dynamic_loop(
             ))
         except Exception:
             pass
-        try:
-            if device_type == "npu":
-                torch.npu.empty_cache()
-        except Exception:
-            pass
+        if device_type == "npu":
+            torch.npu.empty_cache()
         sys.exit(1)
 
 
@@ -536,10 +528,7 @@ def _reval_worker(
             if device.type == "npu":
                 import gc
                 gc.collect()
-                try:
-                    torch.npu.empty_cache()
-                except Exception:
-                    pass
+                torch.npu.empty_cache()
             elif device.type == "cuda":
                 torch.cuda.empty_cache()
 

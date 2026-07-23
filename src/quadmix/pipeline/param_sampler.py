@@ -42,7 +42,7 @@ class ParameterSampler:
         Returns:
             A ParameterSet with randomly sampled parameters.
         """
-        N = self.config.num_quality_criteria
+        N = self.config.num_criteria
         M = self.config.num_domains
 
         # === Step 1: Sample global criteria weights ===
@@ -112,7 +112,7 @@ class ParameterSampler:
         Returns:
             List of n ParameterSet instances.
         """
-        N = self.config.num_quality_criteria
+        N = self.config.num_criteria
         M = self.config.num_domains
 
         a_all = self._rng.uniform(0, 1, size=(n, N))
